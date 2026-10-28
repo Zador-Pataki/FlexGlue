@@ -29,6 +29,7 @@ class FlexGlue(nn.Module):
         "n_layers": 9,
         "num_heads": 8,
         "filter_threshold": 0.1,  # min match confidence
+        "confidence_merge": "gmean",  # two confidences (sparse, cycle): gmean, min, product
         "max_distance_px": 3.0,  # max cycle error, pixels of the resized image
         "min_covisibility": 0.0,  # invalidate all matches if covisibility_score is below
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
@@ -157,8 +158,7 @@ class FlexGlue(nn.Module):
                     context, i, kpts_ni, p2di_nj, size_i, dense.get(j)
                 )
                 pred[f"cycle_error{i}"] = error
-                # geometric mean of the forward and backward confidence
-                confidence = (confidence * back_confidence).sqrt()
+                confidence = self.merge_confidence(confidence, back_confidence, conf)
             pred[f"confidence{i}"] = confidence
         return self.gate_points(pred, context, data0, data1, conf)
 
@@ -494,13 +494,10 @@ class FlexGlue(nn.Module):
             dist = 0.5 * (torch.cdist(p2d0_i1, kpts1) + torch.cdist(kpts0, p2d1_i0))
             m0, m1 = ops.mutual_nn(dist)
             dist0, dist1 = dist.min(2).values, dist.min(1).values
-        # geometric mean of both confidences, as the cycle score
-        scores0 = (
-            pred["confidence0"] * pred["confidence1"].gather(1, m0.clamp(0))
-        ).sqrt()
-        scores1 = (
-            pred["confidence1"] * pred["confidence0"].gather(1, m1.clamp(0))
-        ).sqrt()
+        # merged as the cycle check merges forward and backward confidence
+        c0, c1 = pred["confidence0"], pred["confidence1"]
+        scores0 = self.merge_confidence(c0, c1.gather(1, m0.clamp(0)), conf)
+        scores1 = self.merge_confidence(c1, c0.gather(1, m1.clamp(0)), conf)
         valid0 = (m0 > -1) & (scores0 >= conf.filter_threshold)
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
         valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
@@ -516,6 +513,16 @@ class FlexGlue(nn.Module):
             "matching_scores0": torch.where(valid0, scores0, 0),
             "matching_scores1": torch.where(valid1, scores1, 0),
         }
+
+    def merge_confidence(
+        self, confidence_a: torch.Tensor, confidence_b: torch.Tensor, conf
+    ) -> torch.Tensor:
+        """One confidence of two: gmean, min (strict) or product (squared scale)."""
+        if conf.confidence_merge == "gmean":
+            return (confidence_a * confidence_b).sqrt()
+        if conf.confidence_merge == "min":
+            return torch.minimum(confidence_a, confidence_b)
+        return confidence_a * confidence_b
 
     def dense_matches(
         self, pred: dict, data0: dict, data1: dict, dirs: List[tuple], conf
@@ -608,6 +615,11 @@ class FlexGlue(nn.Module):
             raise ValueError("refine=True needs FlexGlue(refine=True) at init.")
         if c.mp not in (None, "float16", "bfloat16"):
             raise ValueError(f"mp must be 'float16', 'bfloat16' or None: {c.mp!r}")
+        if c.confidence_merge not in ("gmean", "min", "product"):
+            raise ValueError(
+                "confidence_merge must be 'gmean', 'min' or 'product': "
+                f"{c.confidence_merge!r}"
+            )
         if not isinstance(c.coarse_stride, int) or c.coarse_stride <= 0:
             raise ValueError(f"coarse_stride must be a positive int: {c.coarse_stride}")
         if c.early_stop_decay is not None:

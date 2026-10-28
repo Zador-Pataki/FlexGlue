@@ -189,7 +189,7 @@ Inputs per image (`inputs0`, `inputs1`), as returned by `DINOv3Descriptor.descri
 Outputs of `matcher(...)` and `matcher.match(...)`, for each direction `i -> j` whose image `i` has keypoints:
 - `p2d{i}_i{j}`: `(B, M, 2)` predicted location of each keypoint of image `i` in image `j`, in pixels.
 - `p2d{i}_n{j}`: `(B, M, 2)` the same, in normalized coordinates `[-1, 1]`.
-- `confidence{i}`: `(B, M)` confidence that the keypoint has a correspondence. With the cycle check, the geometric mean of the forward confidence and the confidence of the prediction mapped back to `i`.
+- `confidence{i}`: `(B, M)` confidence that the keypoint has a correspondence. With the cycle check, the forward confidence and the confidence of the prediction mapped back to `i`, merged by `confidence_merge`.
 - `valid{i}`: `(B, M)` whether the keypoint passes the covisibility, border and cycle checks.
 - `cycle_error{i}`: `(B, M)` cycle error in pixels, with `max_distance_px` and not `sparse=True`.
 - `covisibility_score`: `(B,)` probability that the two images show the same place.
@@ -272,6 +272,7 @@ Batching has a few requirements:
 `FlexGlue`:
 - ```n_layers```: Number of transformer layers, fewer is faster but less accurate. Default: 9 (all).
 - ```filter_threshold```: Minimum match confidence. Default: 0.1.
+- ```confidence_merge```: How two confidences become one, in sparse mode (both keypoints) and in the cycle check (forward and backward): ```"gmean"``` (geometric mean), ```"min"``` (strict, both must pass ```filter_threshold```) or ```"product"```. ```"gmean"``` and ```"min"``` keep the scale of a single confidence, so ```filter_threshold``` means the same in every mode. ```"product"``` squares it. Default: ```"gmean"```.
 - ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image. None disables it. Default: 3.0.
 - ```min_covisibility```: Reject all matches of pairs with a lower ```covisibility_score```, e.g. 0.8 for noisy image sets. Default: 0.0 (off).
 - ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off).
