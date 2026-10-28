@@ -376,7 +376,8 @@ class SparseMatcherONNX(nn.Module):
             for block in matcher.transformers:
                 block.half()
 
-    def decode_pair(self, f0: torch.Tensor, f1: torch.Tensor) -> PairContext:
+    def encode(self, f0: torch.Tensor, f1: torch.Tensor):
+        """Input tokens and positional encodings of both images."""
         m = self.matcher
         hw0, hw1 = f0.shape[-2:], f1.shape[-2:]
         enc0, enc1 = (
@@ -386,12 +387,20 @@ class SparseMatcherONNX(nn.Module):
         x0, x1 = m.input_proj(f0.flatten(2).mT), m.input_proj(f1.flatten(2).mT)
         if self.fp16:
             x0, x1, enc0, enc1 = x0.half(), x1.half(), enc0.half(), enc1.half()
-        for block in m.transformers[: self.n_layers]:
-            x0, x1 = block(x0, x1, enc0, enc1)
+        return x0, x1, enc0, enc1
+
+    def context(self, x0, x1, hw0, hw1) -> PairContext:
+        """PairContext from the tokens after the last layer."""
         x0, x1 = x0.float(), x1.float()
-        covisibility_score = m.covisibility_score(x0, x1, self.n_layers)
+        covisibility_score = self.matcher.covisibility_score(x0, x1, self.n_layers)
         cf = (x0.mT.unflatten(-1, hw0), x1.mT.unflatten(-1, hw1))
         return PairContext(self.n_layers, covisibility_score, cf)
+
+    def decode_pair(self, f0: torch.Tensor, f1: torch.Tensor) -> PairContext:
+        x0, x1, enc0, enc1 = self.encode(f0, f1)
+        for block in self.matcher.transformers[: self.n_layers]:
+            x0, x1 = block(x0, x1, enc0, enc1)
+        return self.context(x0, x1, f0.shape[-2:], f1.shape[-2:])
 
     def pixel_scale(self, features: torch.Tensor, image_size: torch.Tensor):
         resized_side = self.matcher.stride * max(features.shape[-2:])
@@ -409,9 +418,35 @@ class SparseMatcherONNX(nn.Module):
         max_distance_px: torch.Tensor,
         min_covisibility: torch.Tensor,
     ):
-        head = self.matcher.heads[self.n_layers]
         context = self.decode_pair(features0, features1)
+        return self.match_context(
+            context,
+            features0,
+            features1,
+            kpts0,
+            kpts1,
+            image_size0,
+            image_size1,
+            filter_threshold,
+            max_distance_px,
+            min_covisibility,
+        )
 
+    def match_context(
+        self,
+        context: PairContext,
+        features0: torch.Tensor,
+        features1: torch.Tensor,
+        kpts0: torch.Tensor,
+        kpts1: torch.Tensor,
+        image_size0: torch.Tensor,
+        image_size1: torch.Tensor,
+        filter_threshold: torch.Tensor,
+        max_distance_px: torch.Tensor,
+        min_covisibility: torch.Tensor,
+    ):
+        """Matches of the keypoints given the cross features of the pair."""
+        head = self.matcher.heads[self.n_layers]
         kpts = (kpts0, kpts1)
         sizes = (image_size0, image_size1)
         scales = (
@@ -462,6 +497,225 @@ class SparseMatcherONNX(nn.Module):
         matches0 = torch.where(valid0, m0, -1)
         mscores0 = torch.where(valid0, scores0, 0)
         return matches0, mscores0, context.covisibility_score
+
+
+class LayerScoresMatcherONNX(SparseMatcherONNX):
+    """SparseMatcherONNX that also outputs the covisibility scores after layers.
+
+    Additional outputs covisibility_score_layer{k} for k in check_layers, used
+    to build the early-stopping graph (see add_early_stopping).
+    """
+
+    def __init__(self, matcher: FlexGlue, check_layers, fp16: bool = False):
+        super().__init__(matcher, fp16)
+        self.check_layers = tuple(check_layers)
+
+    def forward(
+        self,
+        features0: torch.Tensor,
+        features1: torch.Tensor,
+        kpts0: torch.Tensor,
+        kpts1: torch.Tensor,
+        image_size0: torch.Tensor,
+        image_size1: torch.Tensor,
+        filter_threshold: torch.Tensor,
+        max_distance_px: torch.Tensor,
+        min_covisibility: torch.Tensor,
+    ):
+        inputs = (
+            kpts0,
+            kpts1,
+            image_size0,
+            image_size1,
+            filter_threshold,
+            max_distance_px,
+            min_covisibility,
+        )
+        x0, x1, enc0, enc1 = self.encode(features0, features1)
+        layer_scores = []
+        for k, block in enumerate(self.matcher.transformers[: self.n_layers], 1):
+            x0, x1 = block(x0, x1, enc0, enc1)
+            if k in self.check_layers:
+                layer_scores.append(self.matcher.covisibility_score(x0, x1, k))
+        context = self.context(x0, x1, features0.shape[-2:], features1.shape[-2:])
+        outputs = self.match_context(context, features0, features1, *inputs)
+        return (*outputs, *layer_scores)
+
+
+def add_early_stopping(path: Path, check_layers, n_layers: int):
+    """Turn the graph of LayerScoresMatcherONNX into nested If nodes.
+
+    After each layer k in check_layers, the pair is rejected without running
+    the remaining layers and the readout if its covisibility score after layer
+    k is below min_covisibility * (1 - early_stop_decay) ** (n_layers - k), as
+    FlexGlue.match(..., early_stop_decay=...). The nodes are split into stages
+    (the nodes needed for the score after the first checked layer, those
+    needed in addition for the next one, ..., and the rest for the outputs),
+    and each stage after a check goes into the else-branch of an If node.
+    Adds the scalar input early_stop_decay: 1 never stops early (nor does
+    min_covisibility = 0). When stopping early, matches0 is -1, mscores0 is 0
+    and covisibility_score is the score of the last layer run.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    model = onnx.load(str(path))
+    graph = model.graph
+    nodes = list(graph.node)
+    producer = {out: i for i, n in enumerate(nodes) for out in n.output}
+    score_names = [f"covisibility_score_layer{k}" for k in check_layers]
+    final_names = [o.name for o in graph.output if o.name not in score_names]
+    assert final_names == MATCHER_OUTPUTS, final_names
+
+    def ancestors(names):
+        seen, stack = set(), [producer[n] for n in names if n in producer]
+        while stack:
+            i = stack.pop()
+            if i in seen:
+                continue
+            seen.add(i)
+            stack.extend(producer[x] for x in nodes[i].input if x in producer)
+        return seen
+
+    # Stage i contains the nodes first needed for the score after check i
+    # (i < len(check_layers)) or for the final outputs.
+    stages, done = [], set()
+    for names in [[n] for n in score_names] + [final_names]:
+        stage = ancestors(names) - done
+        done |= stage
+        stages.append(sorted(stage))  # keep the topological order
+
+    # Each initializer goes into the graph of the earliest stage using it.
+    node_stage = {i: s for s, stage in enumerate(stages) for i in stage}
+    init_stage = {}
+    for i, n in enumerate(nodes):
+        for x in n.input:
+            if i in node_stage:
+                init_stage[x] = min(init_stage.get(x, len(stages)), node_stage[i])
+    inits = {s: [] for s in range(len(stages))}
+    for init in graph.initializer:
+        if init.name in init_stage:
+            inits[init_stage[init.name]].append(init)
+
+    def output_info(names, n0="num_keypoints0"):
+        types = [TensorProto.INT64, TensorProto.FLOAT, TensorProto.FLOAT]
+        shapes = [[1, n0], [1, n0], [1]]
+        return [
+            helper.make_tensor_value_info(n, t, s)
+            for n, t, s in zip(names, types, shapes)
+        ]
+
+    # The final stage produces renamed outputs, since the outer If does.
+    rename = {n: f"{n}_full" for n in final_names}
+    last_nodes = []
+    for i in stages[-1]:
+        n = nodes[i]
+        for j, out in enumerate(n.output):
+            if out in rename:
+                n.output[j] = rename[out]
+        for j, x in enumerate(n.input):
+            if x in rename:
+                n.input[j] = rename[x]
+        last_nodes.append(n)
+    body = helper.make_graph(
+        last_nodes,
+        "layers_after_last_check",
+        [],
+        output_info([rename[n] for n in final_names]),
+        initializer=inits[len(stages) - 1],
+    )
+    # Build the nested Ifs from the innermost check to the outermost.
+    for c in reversed(range(len(check_layers))):
+        k = check_layers[c]
+        score = score_names[c]
+        pre = f"early_stop_layer{k}"
+        reject = [
+            helper.make_node("Shape", ["kpts0"], [f"{pre}_shape"], start=0, end=2),
+            helper.make_node(
+                "ConstantOfShape",
+                [f"{pre}_shape"],
+                [f"{pre}_matches0"],
+                value=helper.make_tensor("v", TensorProto.INT64, [1], [-1]),
+            ),
+            helper.make_node(
+                "ConstantOfShape",
+                [f"{pre}_shape"],
+                [f"{pre}_mscores0"],
+                value=helper.make_tensor("v", TensorProto.FLOAT, [1], [0.0]),
+            ),
+            helper.make_node("Identity", [score], [f"{pre}_covisibility_score"]),
+        ]
+        then_branch = helper.make_graph(
+            reject,
+            f"{pre}_reject",
+            [],
+            output_info(
+                [f"{pre}_matches0", f"{pre}_mscores0", f"{pre}_covisibility_score"]
+            ),
+        )
+        # threshold = min_covisibility * (1 - early_stop_decay) ** (n_layers - k)
+        cond = [
+            helper.make_node(
+                "Constant",
+                [],
+                [f"{pre}_one"],
+                value=helper.make_tensor("v", TensorProto.FLOAT, [], [1.0]),
+            ),
+            helper.make_node(
+                "Constant",
+                [],
+                [f"{pre}_exponent"],
+                value=helper.make_tensor(
+                    "v", TensorProto.FLOAT, [], [float(n_layers - k)]
+                ),
+            ),
+            helper.make_node(
+                "Sub", [f"{pre}_one", "early_stop_decay"], [f"{pre}_keep"]
+            ),
+            helper.make_node(
+                "Pow", [f"{pre}_keep", f"{pre}_exponent"], [f"{pre}_gamma"]
+            ),
+            helper.make_node(
+                "Mul", ["min_covisibility", f"{pre}_gamma"], [f"{pre}_threshold"]
+            ),
+            helper.make_node("Less", [score, f"{pre}_threshold"], [f"{pre}_stop"]),
+        ]
+        outs = (
+            MATCHER_OUTPUTS
+            if c == 0
+            else [f"{n}_after_layer{check_layers[c - 1]}" for n in final_names]
+        )
+        if_node = helper.make_node(
+            "If",
+            [f"{pre}_stop"],
+            outs,
+            name=f"{pre}_if",
+            then_branch=then_branch,
+            else_branch=body,
+        )
+        stage_nodes = [nodes[i] for i in stages[c]] + cond + [if_node]
+        if c == 0:
+            break
+        body = helper.make_graph(
+            stage_nodes,
+            f"layers_after_check{c}",
+            [],
+            output_info(outs),
+            initializer=inits[c],
+        )
+
+    del graph.node[:]
+    graph.node.extend(stage_nodes)
+    del graph.initializer[:]
+    graph.initializer.extend(inits[0])
+    del graph.output[:]
+    graph.output.extend(output_info(MATCHER_OUTPUTS))
+    graph.input.append(
+        helper.make_tensor_value_info("early_stop_decay", TensorProto.FLOAT, [])
+    )
+    del graph.value_info[:]
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
 
 
 def sha256sum(path: Path) -> str:
@@ -553,9 +807,19 @@ def export_matcher(
     opset: int,
     fp16: bool = False,
     fused: bool = True,
+    early_stop_layers=None,
 ):
-    model = SparseMatcherONNX(matcher, fp16=fp16).eval()
+    input_names = list(MATCHER_INPUTS)
     inputs = dummy_matcher_inputs(size)
+    output_names = list(MATCHER_OUTPUTS)
+    early_stop = bool(early_stop_layers)
+    if early_stop:
+        check_layers = sorted(early_stop_layers)
+        assert 1 <= check_layers[0] and check_layers[-1] < matcher.conf.n_layers
+        model = LayerScoresMatcherONNX(matcher, check_layers, fp16=fp16).eval()
+        output_names += [f"covisibility_score_layer{k}" for k in check_layers]
+    else:
+        model = SparseMatcherONNX(matcher, fp16=fp16).eval()
     n0 = torch.export.Dim("num_keypoints0", min=2, max=65536)
     n1 = torch.export.Dim("num_keypoints1", min=2, max=65536)
     dynamic_shapes = {
@@ -576,8 +840,8 @@ def export_matcher(
             model,
             inputs,
             str(path),
-            input_names=MATCHER_INPUTS,
-            output_names=MATCHER_OUTPUTS,
+            input_names=input_names,
+            output_names=output_names,
             dynamic_shapes=dynamic_shapes,
             opset_version=opset,
             dynamo=True,
@@ -590,6 +854,8 @@ def export_matcher(
             },
         )
     make_keypoint_dims_dynamic(path)
+    if early_stop:
+        add_early_stopping(path, check_layers, matcher.conf.n_layers)
 
 
 def sift_keypoints(path: str, num_keypoints: int) -> torch.Tensor:
@@ -620,6 +886,7 @@ def check(args, descriptor, matcher, size):
     sess_match = ort.InferenceSession(
         str(args.output_dir / args.matcher_name), providers=providers
     )
+    early_stop = "early_stop_decay" in [i.name for i in sess_match.get_inputs()]
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     descriptor = descriptor.to(device)
@@ -674,6 +941,8 @@ def check(args, descriptor, matcher, size):
                     "max_distance_px": np.array(3.0, np.float32),
                     "min_covisibility": np.array(min_covisibility, np.float32),
                 }
+                if early_stop:  # never stop early: identical to PyTorch
+                    feeds["early_stop_decay"] = np.array(1.0, np.float32)
                 for _ in range(2):  # warmup
                     sess_match.run(None, feeds)
                 num_runs = 3 if args.cpu else 10
@@ -700,6 +969,20 @@ def check(args, descriptor, matcher, size):
                     f"ort={score_ort[0]:.4f} ort_time={dt * 1000:.0f}ms "
                     f"{'OK' if ok else 'FAIL'}"
                 )
+                if early_stop and min_covisibility > 0:
+                    decay = 0.5
+                    feeds["early_stop_decay"] = np.array(decay, np.float32)
+                    for _ in range(2):  # warmup
+                        sess_match.run(None, feeds)
+                    t = time.time()
+                    for _ in range(num_runs):
+                        m0_es, _, score_es = sess_match.run(None, feeds)
+                    dt = (time.time() - t) / num_runs
+                    print(
+                        f"    early_stop_decay={decay}: matches="
+                        f"{(m0_es[0] > -1).sum():5d} covis={score_es[0]:.4f} "
+                        f"ort_time={dt * 1000:.0f}ms"
+                    )
     print("CHECK", "PASSED" if all_ok else "FAILED")
     return all_ok
 
@@ -728,14 +1011,24 @@ def main():
         "GELU operators of ONNX Runtime.",
     )
     parser.add_argument(
+        "--early_stop_layers",
+        default="",
+        help="Comma-separated layers after which the matcher may stop early on "
+        "non-covisible pairs, e.g. 2,4,6,8 (adds the early_stop_decay input).",
+    )
+    parser.add_argument(
         "--matcher_only",
         action="store_true",
         help="Only export the matcher (the descriptor must exist in output_dir).",
     )
     args = parser.parse_args()
 
+    early_stop_layers = [int(k) for k in args.early_stop_layers.split(",") if k]
     args.matcher_name = (
-        "flexglue_matcher_fp16.onnx" if args.fp16 else "flexglue_matcher.onnx"
+        "flexglue_matcher"
+        + ("_early_stop" if early_stop_layers else "")
+        + ("_fp16" if args.fp16 else "")
+        + ".onnx"
     )
     size = tuple(args.size)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -760,6 +1053,7 @@ def main():
                     args.opset,
                     fp16=args.fp16,
                     fused=not args.no_fused_attention,
+                    early_stop_layers=early_stop_layers,
                 )
             else:
                 fn(model, path, size, args.opset)
