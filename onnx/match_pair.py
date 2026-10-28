@@ -118,6 +118,7 @@ def match(
     filter_threshold: float = 0.1,
     max_distance_px: float = 3.0,
     min_covisibility: float = 0.0,
+    early_stop_decay: float = 0.5,
 ):
     """Match the keypoints of two images given their dense features.
 
@@ -131,26 +132,30 @@ def match(
             location of its match, in pixels of the 512 x 512 resized images.
         min_covisibility: reject all matches if the covisibility score of the
             pair is lower than this value (0 disables the check).
+        early_stop_decay: for matchers exported with --early_stop_layers,
+            reject the pair after layer k without running the remaining layers
+            if its covisibility score is below
+            min_covisibility * (1 - early_stop_decay) ** (9 - k).
 
     Returns:
         matches: (K, 2) indices into kpts0 and kpts1.
         scores: (K,) match confidences.
         covisibility_score: probability that the two images overlap.
     """
-    matches0, mscores0, covisibility_score = session.run(
-        None,
-        {
-            "features0": features0,
-            "features1": features1,
-            "kpts0": kpts0[None].astype(np.float32),
-            "kpts1": kpts1[None].astype(np.float32),
-            "image_size0": np.array([image_size0], dtype=np.float32),
-            "image_size1": np.array([image_size1], dtype=np.float32),
-            "filter_threshold": np.array(filter_threshold, dtype=np.float32),
-            "max_distance_px": np.array(max_distance_px, dtype=np.float32),
-            "min_covisibility": np.array(min_covisibility, dtype=np.float32),
-        },
-    )
+    feeds = {
+        "features0": features0,
+        "features1": features1,
+        "kpts0": kpts0[None].astype(np.float32),
+        "kpts1": kpts1[None].astype(np.float32),
+        "image_size0": np.array([image_size0], dtype=np.float32),
+        "image_size1": np.array([image_size1], dtype=np.float32),
+        "filter_threshold": np.array(filter_threshold, dtype=np.float32),
+        "max_distance_px": np.array(max_distance_px, dtype=np.float32),
+        "min_covisibility": np.array(min_covisibility, dtype=np.float32),
+    }
+    if "early_stop_decay" in [i.name for i in session.get_inputs()]:
+        feeds["early_stop_decay"] = np.array(early_stop_decay, dtype=np.float32)
+    matches0, mscores0, covisibility_score = session.run(None, feeds)
     matches0, mscores0 = matches0[0], mscores0[0]
     valid = matches0 > -1
     matches = np.stack([np.flatnonzero(valid), matches0[valid]], -1)
